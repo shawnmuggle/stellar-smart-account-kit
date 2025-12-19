@@ -16,7 +16,7 @@ The network passphrase and contract ID are exported from [index.ts](./src/index.
 
 # To publish or not to publish
 
-This library is suitable for publishing to NPM. You can publish it to NPM using the `pnpm publish` command.
+This library is suitable for publishing to NPM. You can publish it to NPM using the `npm publish` command.
 
 But you don't need to publish this library to NPM to use it. You can add it to your project's `package.json` using a file path:
 

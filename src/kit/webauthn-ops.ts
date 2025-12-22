@@ -307,8 +307,7 @@ function extractCreateContractWasmHash(
     if (!executable || typeof executable !== "object") continue;
     const execAny = executable as {
       switch?: () => { name: string };
-      wasm?: () => Buffer;
-      wasm?: Buffer;
+      wasm?: (() => Buffer) | Buffer;
     };
     const execSwitch = execAny.switch?.();
     if (execSwitch && execSwitch.name === "contractExecutableWasm") {

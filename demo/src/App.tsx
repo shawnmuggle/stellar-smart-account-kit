@@ -234,8 +234,6 @@ function App() {
           externalWallet: walletAdapter,
           // Enable Relayer fee sponsoring if URL is configured
           relayerUrl: CONFIG.relayerUrl || undefined,
-          // 1 hour signature expiration to handle slow testnet retries
-          timeoutInSeconds: 3600,
         });
         setKit(newKit);
         setConfigValid(true);

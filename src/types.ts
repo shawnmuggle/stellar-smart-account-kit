@@ -120,6 +120,9 @@ export interface SmartAccountConfig {
   /** Transaction timeout in seconds (default: 30) */
   timeoutInSeconds?: number;
 
+  /** Signature expiration in ledgers from current ledger (default: 720 = ~1 hour) */
+  signatureExpirationLedgers?: number;
+
   /** Custom storage adapter for credential persistence */
   storage?: StorageAdapter;
 

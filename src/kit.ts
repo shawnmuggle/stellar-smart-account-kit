@@ -181,6 +181,7 @@ export class SmartAccountKit {
   private readonly accountWasmHash: string;
   private readonly webauthnVerifierAddress: string;
   private readonly timeoutInSeconds: number;
+  private readonly signatureExpirationLedgers: number;
 
   // WebAuthn configuration
   private readonly rpId?: string;
@@ -363,6 +364,7 @@ export class SmartAccountKit {
     this.accountWasmHash = config.accountWasmHash;
     this.webauthnVerifierAddress = config.webauthnVerifierAddress;
     this.timeoutInSeconds = config.timeoutInSeconds ?? 30;
+    this.signatureExpirationLedgers = config.signatureExpirationLedgers ?? 720; // ~1 hour
 
     // WebAuthn
     this.rpId = config.rpId;
@@ -649,7 +651,7 @@ export class SmartAccountKit {
    */
   private async calculateExpiration(): Promise<number> {
     const { sequence } = await this.rpc.getLatestLedger();
-    return sequence + Math.ceil(this.timeoutInSeconds / 5); // ~5 second ledgers
+    return sequence + this.signatureExpirationLedgers;
   }
 
   /**

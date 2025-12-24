@@ -283,9 +283,15 @@ function App() {
 
         log("SDK initialized with provided config", "success");
 
+        // Debug: log relayer URL config
+        console.log("CONFIG.relayerUrl:", CONFIG.relayerUrl);
+        console.log("newKit.relayer:", newKit.relayer);
+
         // Log fee sponsoring status
         if (newKit.relayer) {
-          log("Relayer fee sponsoring enabled", "success");
+          log(`Relayer fee sponsoring enabled: ${CONFIG.relayerUrl}`, "success");
+        } else {
+          log("Relayer NOT configured - transactions will use direct RPC", "warning");
         }
 
         // Sync credentials - clean up any that are already deployed,

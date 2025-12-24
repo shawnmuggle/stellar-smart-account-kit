@@ -12,13 +12,8 @@ id = "6d548e99f4e14aeb93c25c7d2c0928b5"
 # For preview/dev:
 # preview_id = "<your-preview-kv-namespace-id>"
 
-# Increase CPU limit for long-running retries on testnet.
-# On testnet, if Relayer channel accounts are missing (after testnet reset),
-# we fund them via friendbot and retry for up to 5 minutes.
-# Network wait time (fetch calls) doesn't count toward CPU time.
-# Mainnet uses default limit since no retries occur there.
-[limits]
-cpu_ms = 300_000
+# NOTE: CPU limits removed to support Cloudflare free tier
+# On paid plans, you can add [limits] cpu_ms = 300_000 for testnet retries
 
 [vars]
 # Network this instance serves
@@ -38,4 +33,4 @@ RELAYER_BASE_URL = "https://channels.openzeppelin.com"
 
 [[env.production.kv_namespaces]]
 binding = "API_KEYS"
-id = "4afa99de423a48feb9827ab35b158e5e"
+id = "711dd12e8c9e4fd29dcc858f720e2a06"

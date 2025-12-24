@@ -24,8 +24,19 @@ export class IndexedDBStorage implements StorageAdapter {
   }
 
   private async getDB(): Promise<IDBDatabase> {
+    // Check if we have a valid, open connection
     if (this.dbPromise) {
-      return this.dbPromise;
+      try {
+        const db = await this.dbPromise;
+        // Verify the connection is still open by checking objectStoreNames
+        // This will throw if the connection is closed
+        if (db.objectStoreNames.length >= 0) {
+          return db;
+        }
+      } catch {
+        // Connection was closed, reset and reopen
+        this.dbPromise = null;
+      }
     }
 
     this.dbPromise = new Promise((resolve, reject) => {
@@ -37,11 +48,17 @@ export class IndexedDBStorage implements StorageAdapter {
       const request = indexedDB.open(this.dbName, DB_VERSION);
 
       request.onerror = () => {
+        this.dbPromise = null;
         reject(new Error(`Failed to open IndexedDB: ${request.error?.message}`));
       };
 
       request.onsuccess = () => {
-        resolve(request.result);
+        const db = request.result;
+        // Handle unexpected close events
+        db.onclose = () => {
+          this.dbPromise = null;
+        };
+        resolve(db);
       };
 
       request.onupgradeneeded = (event) => {

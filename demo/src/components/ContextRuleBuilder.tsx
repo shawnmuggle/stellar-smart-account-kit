@@ -362,20 +362,34 @@ export function ContextRuleBuilder({
 
         loadPolicies();
       } else {
-        // Create mode - reset form
+        // Create mode - reset form with default Threshold(1) policy
         setName("");
         setContextType("default");
         setContractAddress("");
         setWasmHash("");
         setSigners([]);
-        setSelectedPolicies([]);
+        // Auto-add Threshold(1) policy so any single signer can authorize
+        const thresholdPolicy = availablePolicies.find((p) => p.type === "threshold");
+        if (thresholdPolicy) {
+          setSelectedPolicies([{
+            policy: thresholdPolicy,
+            threshold: 1,
+            spendingLimit: "1000",
+            spendingPeriodDays: 1,
+            weightedThreshold: 1,
+            signerWeights: new Map(),
+            customParams: "{}",
+          }]);
+        } else {
+          setSelectedPolicies([]);
+        }
         setHasExpiration(false);
       }
       setError(null);
       setSelectedPolicyToAdd("");
       setSelectedSignerId(""); // Will be set to first available when entries are computed
     }
-  }, [isOpen, editingRule, activeCredentialId]);
+  }, [isOpen, editingRule, activeCredentialId, availablePolicies]);
 
   // Define type for signer entries
   type SignerEntryInfo = {

@@ -109,6 +109,9 @@ import {
 import {
   buildDeployTransaction,
   submitDeploymentTx,
+  buildFactoryDeployTransaction,
+  submitFactoryDeploymentTx,
+  deriveFactoryContractAddress,
 } from "./kit/deploy-ops";
 import {
   sign,
@@ -209,6 +212,9 @@ export class SmartAccountKit {
 
   // Deployer keypair (used as source account for contract deployment)
   private readonly deployerKeypair: Keypair;
+
+  // Factory contract address for gas-sponsored deployments (optional)
+  private readonly factoryContractAddress?: string;
 
   // ==========================================================================
   // Sub-managers for organized access to contract methods
@@ -408,6 +414,9 @@ export class SmartAccountKit {
       hash(Buffer.from("openzeppelin-smart-account-kit"))
     );
 
+    // Factory contract address for gas-sponsored deployments (optional)
+    this.factoryContractAddress = config.factoryContractAddress;
+
     // Event emitter (initialized first as other managers may use it)
     this.events = new SmartAccountEventEmitter();
 
@@ -459,7 +468,9 @@ export class SmartAccountKit {
       submitDeploymentTx: (tx, credentialId, options) =>
         this.submitDeploymentTx(tx as contract.AssembledTransaction<null>, credentialId, options),
       deriveContractAddress: (credentialIdBuffer) =>
-        deriveContractAddress(credentialIdBuffer, this.deployerKeypair.publicKey(), this.networkPassphrase),
+        this.factoryContractAddress
+          ? deriveFactoryContractAddress(this.factoryContractAddress, credentialIdBuffer, this.networkPassphrase)
+          : deriveContractAddress(credentialIdBuffer, this.deployerKeypair.publicKey(), this.networkPassphrase),
       shouldUseFeeSponsoring: (options) => this.shouldUseFeeSponsoring(options),
     });
 
@@ -713,15 +724,81 @@ export class SmartAccountKit {
       {
         storage: this.storage,
         events: this.events,
-        deployerKeypair: this.deployerKeypair,
-        networkPassphrase: this.networkPassphrase,
         sessionExpiryMs: this.sessionExpiryMs,
         createPasskey: (name, user, selection) => this.createPasskey(name, user, selection),
-        buildDeployTransaction: (credentialIdBuffer, publicKey) =>
-          this.buildDeployTransaction(credentialIdBuffer, publicKey),
-        signWithDeployer: (tx) => this.signWithDeployer(tx),
-        submitDeploymentTx: (tx, credentialId, submissionOptions) =>
-          this.submitDeploymentTx(tx, credentialId, submissionOptions),
+        buildDeployment: async (credentialIdBuffer, publicKey) => {
+          if (this.factoryContractAddress) {
+            // Factory-based deployment (gas-sponsorable)
+            const { transaction, contractId, hostFunc } = await buildFactoryDeployTransaction(
+              {
+                factoryContractAddress: this.factoryContractAddress,
+                accountWasmHash: this.accountWasmHash,
+                webauthnVerifierAddress: this.webauthnVerifierAddress,
+                networkPassphrase: this.networkPassphrase,
+                rpc: this.rpc,
+                deployerKeypair: this.deployerKeypair,
+                timeoutInSeconds: this.timeoutInSeconds,
+              },
+              credentialIdBuffer,
+              publicKey
+            );
+            return {
+              contractId,
+              factoryDeployData: { transaction, hostFunc },
+            };
+          } else {
+            // Direct deployment (requires deployer to pay fees)
+            const deployTx = await this.buildDeployTransaction(credentialIdBuffer, publicKey);
+            const contractId = deriveContractAddress(
+              credentialIdBuffer,
+              this.deployerKeypair.publicKey(),
+              this.networkPassphrase
+            );
+            return { contractId, deployTx };
+          }
+        },
+        signAndSubmitDeployment: async (deployData, credentialId, submissionOptions) => {
+          if (deployData.factoryDeployData) {
+            // Factory deployment
+            const { transaction, hostFunc } = deployData.factoryDeployData;
+            const signedTransaction = transaction.toXDR();
+
+            if (submissionOptions) {
+              const submitResult = await submitFactoryDeploymentTx(
+                {
+                  storage: this.storage,
+                  rpc: this.rpc,
+                  relayer: this.relayer,
+                  deployerKeypair: this.deployerKeypair,
+                },
+                transaction,
+                hostFunc,
+                credentialId,
+                submissionOptions
+              );
+              return { signedTransaction, submitResult };
+            }
+            return { signedTransaction };
+          } else if (deployData.deployTx) {
+            // Direct deployment
+            await this.signWithDeployer(deployData.deployTx);
+            if (!deployData.deployTx.signed) {
+              throw new Error("Failed to sign deployment transaction");
+            }
+            const signedTransaction = deployData.deployTx.signed.toXDR();
+
+            if (submissionOptions) {
+              const submitResult = await this.submitDeploymentTx(
+                deployData.deployTx,
+                credentialId,
+                submissionOptions
+              );
+              return { signedTransaction, submitResult };
+            }
+            return { signedTransaction };
+          }
+          throw new Error("No deployment data provided");
+        },
         fundWallet: (nativeTokenContract, fundOptions) =>
           this.fundWallet(nativeTokenContract, fundOptions),
         setConnectedState: (contractId, credentialId) =>
@@ -863,12 +940,14 @@ export class SmartAccountKit {
       {
         storage: this.storage,
         rpc: this.rpc,
-        deployerKeypair: this.deployerKeypair,
-        networkPassphrase: this.networkPassphrase,
         sessionExpiryMs: this.sessionExpiryMs,
         events: this.events,
         setConnectedState: (nextContractId, nextCredentialId) =>
           this.setConnectedState(nextContractId, nextCredentialId),
+        deriveContractAddress: (credentialIdBuffer) =>
+          this.factoryContractAddress
+            ? deriveFactoryContractAddress(this.factoryContractAddress, credentialIdBuffer, this.networkPassphrase)
+            : deriveContractAddress(credentialIdBuffer, this.deployerKeypair.publicKey(), this.networkPassphrase),
       },
       credentialId,
       contractId

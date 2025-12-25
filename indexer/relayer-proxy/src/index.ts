@@ -1,17 +1,18 @@
 /**
  * Smart Account Relayer Proxy - Cloudflare Worker
  *
- * This worker provides a proxy for OpenZeppelin Relayer Channels service.
- * It manages API keys per client IP, allowing the frontend to submit transactions
- * without exposing the backend API key.
- *
- * Uses the official @openzeppelin/relayer-plugin-channels SDK.
+ * This worker provides a proxy for OpenZeppelin Relayer Channels service,
+ * with a self-sponsored fallback for mainnet when OZ channels are underfunded.
  *
  * Features:
+ * - Primary: Uses OZ Relayer Channels SDK for gas sponsoring
+ * - Fallback: Self-sponsored mode using your own funded G-address
  * - Automatic API key generation per IP address (persisted indefinitely)
- * - One API key per IP - Relayer's usage limits reset every 24 hours on their side
  * - Rate limiting via Relayer's built-in fair use policy
  * - Separate deployments for testnet and mainnet
+ *
+ * On mainnet, if OZ Channels fail with TxInsufficientBalance, we fall back
+ * to self-sponsored mode using SPONSOR_SECRET_KEY.
  */
 
 import { Hono } from "hono";
@@ -21,13 +22,22 @@ import {
   PluginExecutionError,
   PluginTransportError,
 } from "@openzeppelin/relayer-plugin-channels";
+import {
+  Keypair,
+  TransactionBuilder,
+  Operation,
+  xdr,
+  Networks,
+  Transaction,
+  rpc,
+} from "@stellar/stellar-sdk";
 
 interface StoredApiKey {
   apiKey: string;
   createdAt: number;
 }
 
-// Hono app
+// Hono app with typed environment bindings
 const app = new Hono<{ Bindings: Env }>();
 
 // Enable CORS
@@ -167,16 +177,190 @@ async function fundWithFriendbot(account: string): Promise<boolean> {
   }
 }
 
+/**
+ * Get network passphrase based on environment
+ */
+function getNetworkPassphrase(network: string): string {
+  return network === "mainnet"
+    ? Networks.PUBLIC
+    : Networks.TESTNET;
+}
+
+/**
+ * Get RPC URL based on environment
+ */
+function getRpcUrl(network: string): string {
+  return network === "mainnet"
+    ? "https://soroban-rpc.mainnet.stellar.gateway.fm"
+    : "https://soroban-testnet.stellar.org";
+}
+
+/**
+ * Self-sponsored transaction submission.
+ * Builds and submits a transaction using your own funded G-address as the fee payer.
+ *
+ * This is used as a fallback when OZ Channels fail (e.g., underfunded on mainnet).
+ */
+async function submitSelfSponsored(
+  env: Env,
+  func: string,
+  auth: string[]
+): Promise<{ hash: string; status: string }> {
+  if (!env.SPONSOR_SECRET_KEY) {
+    throw new Error("Self-sponsored mode not configured: SPONSOR_SECRET_KEY missing");
+  }
+
+  const networkPassphrase = getNetworkPassphrase(env.NETWORK);
+  const rpcUrl = getRpcUrl(env.NETWORK);
+  const server = new rpc.Server(rpcUrl);
+
+  // Parse the sponsor keypair
+  const sponsorKeypair = Keypair.fromSecret(env.SPONSOR_SECRET_KEY);
+  const sponsorPublicKey = sponsorKeypair.publicKey();
+
+  // Get the sponsor account
+  const sponsorAccount = await server.getAccount(sponsorPublicKey);
+
+  // Parse the host function from base64 XDR
+  const hostFunction = xdr.HostFunction.fromXDR(func, "base64");
+
+  // Parse auth entries from base64 XDR
+  const authEntries = auth.map((a) => xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"));
+
+  // Build the transaction with invokeHostFunction operation
+  const transaction = new TransactionBuilder(sponsorAccount, {
+    fee: "1000000", // 0.1 XLM max fee (will be adjusted by simulation)
+    networkPassphrase,
+  })
+    .addOperation(
+      Operation.invokeHostFunction({
+        func: hostFunction,
+        auth: authEntries,
+      })
+    )
+    .setTimeout(60)
+    .build();
+
+  // Simulate the transaction to get resource requirements
+  const simResult = await server.simulateTransaction(transaction);
+
+  if (rpc.Api.isSimulationError(simResult)) {
+    throw new Error(`Simulation failed: ${simResult.error}`);
+  }
+
+  if (!rpc.Api.isSimulationSuccess(simResult)) {
+    throw new Error("Simulation did not succeed");
+  }
+
+  // Assemble the transaction with simulation results
+  const preparedTx = rpc.assembleTransaction(
+    transaction,
+    simResult
+  ).build();
+
+  // Sign with sponsor keypair
+  preparedTx.sign(sponsorKeypair);
+
+  // Submit the transaction
+  const sendResult = await server.sendTransaction(preparedTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(`Transaction submission failed: ${sendResult.errorResult?.toXDR("base64") || "unknown error"}`);
+  }
+
+  // Poll for result
+  const hash = sendResult.hash;
+  let getResult = await server.getTransaction(hash);
+  const maxWaitMs = 30000;
+  const startTime = Date.now();
+
+  while (getResult.status === "NOT_FOUND" && Date.now() - startTime < maxWaitMs) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    getResult = await server.getTransaction(hash);
+  }
+
+  if (getResult.status === "SUCCESS") {
+    return { hash, status: "SUCCESS" };
+  } else if (getResult.status === "FAILED") {
+    throw new Error(`Transaction failed on-chain: ${hash}`);
+  } else {
+    // Still NOT_FOUND after waiting
+    return { hash, status: "PENDING" };
+  }
+}
+
+/**
+ * Self-sponsored XDR submission (fee-bump).
+ * Wraps a signed transaction in a fee-bump transaction using your sponsor account.
+ */
+async function submitSelfSponsoredXdr(
+  env: Env,
+  txXdr: string
+): Promise<{ hash: string; status: string }> {
+  if (!env.SPONSOR_SECRET_KEY) {
+    throw new Error("Self-sponsored mode not configured: SPONSOR_SECRET_KEY missing");
+  }
+
+  const networkPassphrase = getNetworkPassphrase(env.NETWORK);
+  const rpcUrl = getRpcUrl(env.NETWORK);
+  const server = new rpc.Server(rpcUrl);
+
+  // Parse the sponsor keypair
+  const sponsorKeypair = Keypair.fromSecret(env.SPONSOR_SECRET_KEY);
+
+  // Parse the inner transaction
+  const innerTx = TransactionBuilder.fromXDR(txXdr, networkPassphrase) as Transaction;
+
+  // Create a fee-bump transaction
+  const feeBumpTx = TransactionBuilder.buildFeeBumpTransaction(
+    sponsorKeypair,
+    "1000000", // 0.1 XLM max fee
+    innerTx,
+    networkPassphrase
+  );
+
+  // Sign the fee-bump with sponsor
+  feeBumpTx.sign(sponsorKeypair);
+
+  // Submit the fee-bump transaction
+  const sendResult = await server.sendTransaction(feeBumpTx);
+
+  if (sendResult.status === "ERROR") {
+    throw new Error(`Transaction submission failed: ${sendResult.errorResult?.toXDR("base64") || "unknown error"}`);
+  }
+
+  // Poll for result
+  const hash = sendResult.hash;
+  let getResult = await server.getTransaction(hash);
+  const maxWaitMs = 30000;
+  const startTime = Date.now();
+
+  while (getResult.status === "NOT_FOUND" && Date.now() - startTime < maxWaitMs) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    getResult = await server.getTransaction(hash);
+  }
+
+  if (getResult.status === "SUCCESS") {
+    return { hash, status: "SUCCESS" };
+  } else if (getResult.status === "FAILED") {
+    throw new Error(`Transaction failed on-chain: ${hash}`);
+  } else {
+    return { hash, status: "PENDING" };
+  }
+}
+
 // ============================================================================
 // API Endpoints
 // ============================================================================
 
 // Health check
 app.get("/", (c) => {
+  const hasSponsor = !!c.env.SPONSOR_SECRET_KEY;
   return c.json({
     status: "ok",
     service: "smart-account-relayer-proxy",
     network: c.env.NETWORK,
+    selfSponsorEnabled: hasSponsor,
   });
 });
 
@@ -185,28 +369,20 @@ app.get("/", (c) => {
  * POST /
  *
  * Two modes:
- * 1. { func: string, auth: string[] } - Relayer builds tx with channel accounts
- * 2. { xdr: string } - Relayer fee-bumps a signed transaction
+ * 1. { func: string, auth: string[] } - Builds tx with sponsor account
+ * 2. { xdr: string } - Fee-bumps a signed transaction
  *
  * Use func+auth for Address credentials (transfers, wallet operations).
  * Use xdr for source_account auth (deployment) - tx must be signed.
  *
- * On testnet, if channel accounts are missing (after testnet reset),
- * we'll fund them via friendbot and retry for up to 5 minutes.
+ * Network behavior:
+ * - Mainnet: Uses self-sponsored mode (SPONSOR_SECRET_KEY required)
+ * - Testnet: Uses OZ Channels with Friendbot retry for missing accounts
  */
 app.post("/", async (c) => {
   const ip = getClientIP(c.req.raw);
-  const apiKeyResult = await getOrCreateApiKey(c.env, ip);
-
-  if (!apiKeyResult) {
-    return c.json(
-      {
-        success: false,
-        error: "Could not obtain API key. Service may be misconfigured.",
-      },
-      500
-    );
-  }
+  const isMainnet = c.env.NETWORK === "mainnet";
+  const hasSponsor = !!c.env.SPONSOR_SECRET_KEY;
 
   try {
     const body = await c.req.json<{
@@ -233,16 +409,80 @@ app.post("/", async (c) => {
       );
     }
 
+    // ========================================================================
+    // MAINNET: Use self-sponsored mode by default
+    // ========================================================================
+    if (isMainnet) {
+      if (!hasSponsor) {
+        return c.json(
+          {
+            success: false,
+            error: "Mainnet requires SPONSOR_SECRET_KEY to be configured.",
+          },
+          500
+        );
+      }
+
+      console.log("Mainnet: Using self-sponsored mode...");
+
+      try {
+        if (hasXdr) {
+          const result = await submitSelfSponsoredXdr(c.env, body.xdr!);
+          return c.json({
+            success: true,
+            data: {
+              hash: result.hash,
+              status: result.status,
+              mode: "self-sponsored",
+            },
+          });
+        } else {
+          const result = await submitSelfSponsored(c.env, body.func!, body.auth!);
+          return c.json({
+            success: true,
+            data: {
+              hash: result.hash,
+              status: result.status,
+              mode: "self-sponsored",
+            },
+          });
+        }
+      } catch (selfSponsorError) {
+        console.error("Self-sponsored submission failed:", selfSponsorError);
+        return c.json(
+          {
+            success: false,
+            error: selfSponsorError instanceof Error ? selfSponsorError.message : "Self-sponsored submission failed",
+            mode: "self-sponsored",
+          },
+          500
+        );
+      }
+    }
+
+    // ========================================================================
+    // TESTNET: Use OZ Channels with Friendbot retry
+    // ========================================================================
+    const apiKeyResult = await getOrCreateApiKey(c.env, ip);
+
+    if (!apiKeyResult) {
+      return c.json(
+        {
+          success: false,
+          error: "Could not obtain API key from OZ Channels.",
+        },
+        500
+      );
+    }
+
     const client = createClient(c.env, apiKeyResult.apiKey);
-    const isTestnet = c.env.NETWORK === "testnet";
 
     // On testnet, retry for up to 5 minutes to handle channel accounts needing funding
-    // On mainnet, only try once (no friendbot available)
     const TESTNET_RETRY_DURATION_MS = 5 * 60 * 1000; // 5 minutes
-    const deadline = isTestnet ? Date.now() + TESTNET_RETRY_DURATION_MS : 0;
+    const deadline = Date.now() + TESTNET_RETRY_DURATION_MS;
     const fundedAccounts = new Set<string>(); // Track accounts we've already funded
 
-    // Submit with retry logic for missing accounts (testnet only)
+    // Submit with retry logic for missing accounts
     while (true) {
       try {
         if (hasXdr) {
@@ -254,6 +494,7 @@ app.post("/", async (c) => {
               transactionId: result.transactionId,
               hash: result.hash,
               status: result.status,
+              mode: "oz-channels",
             },
           });
         } else {
@@ -268,6 +509,7 @@ app.post("/", async (c) => {
               transactionId: result.transactionId,
               hash: result.hash,
               status: result.status,
+              mode: "oz-channels",
             },
           });
         }
@@ -278,7 +520,7 @@ app.post("/", async (c) => {
         const missingAccount = extractMissingAccount(errorMessage);
         const timeRemaining = deadline - Date.now();
 
-        if (missingAccount && isTestnet && timeRemaining > 0) {
+        if (missingAccount && timeRemaining > 0) {
           // Only fund each account once per request
           if (!fundedAccounts.has(missingAccount)) {
             console.log(`Account ${missingAccount} not found. Funding via friendbot (${Math.round(timeRemaining / 1000)}s remaining)...`);
@@ -382,6 +624,7 @@ app.get("/status", async (c) => {
   const kvKey = getKVKey(ip);
 
   const apiKey = (await c.env.API_KEYS.get(kvKey, "json")) as StoredApiKey | null;
+  const hasSponsor = !!c.env.SPONSOR_SECRET_KEY;
 
   return c.json({
     success: true,
@@ -390,6 +633,7 @@ app.get("/status", async (c) => {
       network: c.env.NETWORK,
       hasKey: !!apiKey,
       keyCreatedAt: apiKey?.createdAt,
+      selfSponsorEnabled: hasSponsor,
     },
   });
 });

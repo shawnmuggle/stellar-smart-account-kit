@@ -28,7 +28,13 @@ const CONFIG = {
   ed25519VerifierAddress: import.meta.env.VITE_ED25519_VERIFIER_ADDRESS || "CDGMOL3BP6Y6LYOXXTRNXBNJ2SLNTQ47BGG3LOS2OBBE657E3NYCN54B",
   // Relayer fee sponsoring (optional)
   relayerUrl: import.meta.env.VITE_RELAYER_URL || "",
+  // Factory contract for gas-sponsored deployments (optional)
+  factoryContractAddress: import.meta.env.VITE_FACTORY_CONTRACT_ADDRESS || "",
 };
+
+// Network detection helper
+const isMainnet = CONFIG.networkPassphrase === Networks.PUBLIC;
+const networkName = isMainnet ? "Mainnet" : "Testnet";
 
 // Known policy contracts - reads from environment variables with testnet defaults
 const KNOWN_POLICIES = [
@@ -262,6 +268,9 @@ function App() {
         });
         await walletAdapter.init();
 
+        // Factory deployment only makes sense with Relayer (for gas sponsoring)
+        const useFactory = CONFIG.relayerUrl && CONFIG.factoryContractAddress;
+
         const newKit = new SmartAccountKit({
           rpcUrl: CONFIG.rpcUrl,
           networkPassphrase: CONFIG.networkPassphrase,
@@ -272,6 +281,9 @@ function App() {
           externalWallet: walletAdapter,
           // Enable Relayer fee sponsoring if URL is configured
           relayerUrl: CONFIG.relayerUrl || undefined,
+          // Enable factory-based deployment for gas-sponsored wallet creation
+          // Only use factory if relayer is also configured
+          factoryContractAddress: useFactory ? CONFIG.factoryContractAddress : undefined,
         });
         setKit(newKit);
         setConfigValid(true);
@@ -285,13 +297,18 @@ function App() {
 
         // Debug: log relayer URL config
         console.log("CONFIG.relayerUrl:", CONFIG.relayerUrl);
+        console.log("CONFIG.factoryContractAddress:", CONFIG.factoryContractAddress);
+        console.log("useFactory:", useFactory);
         console.log("newKit.relayer:", newKit.relayer);
 
         // Log fee sponsoring status
         if (newKit.relayer) {
           log(`Relayer fee sponsoring enabled: ${CONFIG.relayerUrl}`, "success");
+          if (useFactory) {
+            log(`Factory deployment enabled: ${CONFIG.factoryContractAddress}`, "success");
+          }
         } else {
-          log("Relayer NOT configured - transactions will use direct RPC", "warning");
+          log("Relayer NOT configured - transactions will use direct RPC", "info");
         }
 
         // Sync credentials - clean up any that are already deployed,
@@ -785,7 +802,7 @@ function App() {
         </details>
 
         <div style={{ display: "flex", gap: "12px", alignItems: "center", marginTop: "16px" }}>
-          <span className="network-badge">Testnet</span>
+          <span className={`network-badge ${isMainnet ? 'mainnet' : ''}`}>{networkName}</span>
           <span
             className={`status ${configValid ? "connected" : "disconnected"}`}
           >
@@ -993,16 +1010,18 @@ function App() {
               <button className="secondary" onClick={handleDisconnect}>
                 Disconnect
               </button>
-              <button
-                onClick={handleFundWallet}
-                disabled={loading !== null}
-              >
-                {loading === "Funding wallet..." ? (
-                  <span className="spinner" />
-                ) : (
-                  "Fund Wallet (Testnet)"
-                )}
-              </button>
+              {!isMainnet && (
+                <button
+                  onClick={handleFundWallet}
+                  disabled={loading !== null}
+                >
+                  {loading === "Funding wallet..." ? (
+                    <span className="spinner" />
+                  ) : (
+                    "Fund Wallet (Testnet)"
+                  )}
+                </button>
+              )}
             </>
           )}
         </div>

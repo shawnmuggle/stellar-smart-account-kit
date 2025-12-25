@@ -208,6 +208,31 @@ export interface SmartAccountConfig {
    * ```
    */
   relayerUrl?: string;
+
+  /**
+   * Optional factory contract configuration for gas-sponsored deployments.
+   *
+   * When configured, wallet deployments use a permissionless factory contract
+   * instead of direct deployment. This enables full gas sponsoring via Relayer
+   * because factory invocations have no auth requirements (unlike direct deploy
+   * which uses source_account credentials).
+   *
+   * The factory contract should be permissionless and expose:
+   * - `deploy(wasm_hash: BytesN<32>, salt: BytesN<32>, constructor_args: Vec<Val>) -> Address`
+   *
+   * @example
+   * ```typescript
+   * const kit = new SmartAccountKit({
+   *   // ... other config
+   *   factoryContractAddress: 'CCMGFBBY44JOY6LMM2HTADT5MZ77W75PMAT2QS7GQ4KVNC2RSEBTIAEJ',
+   *   relayerUrl: 'https://my-relayer-proxy.example.com',
+   * });
+   *
+   * // Deployments will now use the factory and be fully sponsored
+   * const wallet = await kit.createWallet('MyApp', 'user@example.com');
+   * ```
+   */
+  factoryContractAddress?: string;
 }
 
 

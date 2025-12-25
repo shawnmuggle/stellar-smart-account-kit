@@ -1,5 +1,5 @@
 import type { AuthenticationResponseJSON, PublicKeyCredentialRequestOptionsJSON, RegistrationResponseJSON, AuthenticatorTransportFuture } from "@simplewebauthn/browser";
-import { Keypair, xdr } from "@stellar/stellar-sdk";
+import { Keypair, xdr, Transaction } from "@stellar/stellar-sdk";
 import base64url from "base64url";
 import type {
   StorageAdapter,
@@ -13,14 +13,12 @@ import type {
 import type { SmartAccountEventEmitter } from "../events";
 import type { contract, rpc } from "@stellar/stellar-sdk";
 import { WEBAUTHN_TIMEOUT_MS, DEFAULT_SESSION_EXPIRY_MS } from "../constants";
-import { deriveContractAddress, generateChallenge } from "../utils";
+import { generateChallenge } from "../utils";
 
 export async function createWallet(
   deps: {
     storage: StorageAdapter;
     events: SmartAccountEventEmitter;
-    deployerKeypair: Keypair;
-    networkPassphrase: string;
     sessionExpiryMs: number;
     createPasskey: (
       appName: string,
@@ -31,16 +29,29 @@ export async function createWallet(
         userVerification?: "discouraged" | "preferred" | "required";
       }
     ) => Promise<{ rawResponse: RegistrationResponseJSON; credentialId: string; publicKey: Uint8Array }>;
-    buildDeployTransaction: (
+    // Returns contractId and either deployTx (direct) or factoryDeployData (factory)
+    buildDeployment: (
       credentialIdBuffer: Buffer,
       publicKey: Uint8Array
-    ) => Promise<contract.AssembledTransaction<null>>;
-    signWithDeployer: (tx: contract.AssembledTransaction<null>) => Promise<void>;
-    submitDeploymentTx: (
-      tx: contract.AssembledTransaction<null>,
+    ) => Promise<{
+      contractId: string;
+      deployTx?: contract.AssembledTransaction<null>;
+      factoryDeployData?: {
+        transaction: Transaction;
+        hostFunc: xdr.HostFunction;
+      };
+    }>;
+    signAndSubmitDeployment: (
+      deployData: {
+        deployTx?: contract.AssembledTransaction<null>;
+        factoryDeployData?: {
+          transaction: Transaction;
+          hostFunc: xdr.HostFunction;
+        };
+      },
       credentialId: string,
       options?: SubmissionOptions
-    ) => Promise<TransactionResult>;
+    ) => Promise<{ signedTransaction: string; submitResult?: TransactionResult }>;
     fundWallet: (
       nativeTokenContract: string,
       options?: { forceMethod?: SubmissionMethod }
@@ -68,14 +79,18 @@ export async function createWallet(
     options?.authenticatorSelection
   );
 
+  const credentialIdBuffer = base64url.toBuffer(credentialId);
+
+  // Build deployment (either direct or via factory)
+  const { contractId, deployTx, factoryDeployData } = await deps.buildDeployment(
+    credentialIdBuffer,
+    publicKey
+  );
+
   const storedCredential: StoredCredential = {
     credentialId,
     publicKey,
-    contractId: deriveContractAddress(
-      base64url.toBuffer(credentialId),
-      deps.deployerKeypair.publicKey(),
-      deps.networkPassphrase
-    ),
+    contractId,
     nickname: options?.nickname ?? `${userName} - ${new Date().toLocaleDateString()}`,
     createdAt: Date.now(),
     transports: rawResponse?.response?.transports,
@@ -86,24 +101,16 @@ export async function createWallet(
   await deps.storage.save(storedCredential);
   deps.events.emit("credentialCreated", { credential: storedCredential });
 
-  const credentialIdBuffer = base64url.toBuffer(credentialId);
-  const contractId = deriveContractAddress(
-    credentialIdBuffer,
-    deps.deployerKeypair.publicKey(),
-    deps.networkPassphrase
-  );
-
-  const deployTx = await deps.buildDeployTransaction(
-    credentialIdBuffer,
-    publicKey
-  );
-
   const submissionOpts: SubmissionOptions = { forceMethod: options?.forceMethod };
-  await deps.signWithDeployer(deployTx);
-  if (!deployTx.signed) {
-    throw new Error("Failed to sign deployment transaction");
-  }
-  const signedTransaction = deployTx.signed.toXDR();
+
+  // Sign and optionally submit
+  const { signedTransaction, submitResult: maybeSubmitResult } = await deps.signAndSubmitDeployment(
+    { deployTx, factoryDeployData },
+    credentialId,
+    options?.autoSubmit ? submissionOpts : undefined
+  );
+
+  const submitResult = options?.autoSubmit ? maybeSubmitResult : undefined;
 
   deps.setConnectedState(contractId, credentialId);
 
@@ -116,10 +123,6 @@ export async function createWallet(
     connectedAt: now,
     expiresAt: now + (deps.sessionExpiryMs ?? DEFAULT_SESSION_EXPIRY_MS),
   });
-
-  const submitResult = options?.autoSubmit
-    ? await deps.submitDeploymentTx(deployTx, credentialId, submissionOpts)
-    : undefined;
 
   let fundResult: (TransactionResult & { amount?: number }) | undefined;
   if (options?.autoFund && submitResult?.success) {
@@ -209,11 +212,10 @@ export async function connectWithCredentials(
   deps: {
     storage: StorageAdapter;
     rpc: rpc.Server;
-    deployerKeypair: Keypair;
-    networkPassphrase: string;
     sessionExpiryMs: number;
     events: SmartAccountEventEmitter;
     setConnectedState: (contractId: string, credentialId: string) => void;
+    deriveContractAddress: (credentialIdBuffer: Buffer) => string;
   },
   credentialId?: string,
   contractId?: string
@@ -228,11 +230,7 @@ export async function connectWithCredentials(
 
   if (!contractId && credentialId) {
     const credentialIdBuffer = base64url.toBuffer(credentialId);
-    contractId = deriveContractAddress(
-      credentialIdBuffer,
-      deps.deployerKeypair.publicKey(),
-      deps.networkPassphrase
-    );
+    contractId = deps.deriveContractAddress(credentialIdBuffer);
   }
 
   if (!contractId) {

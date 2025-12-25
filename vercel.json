@@ -1,6 +1,6 @@
 {
   "buildCommand": "pnpm -w run build:demo",
-  "outputDirectory": "demo/dist",
+  "outputDirectory": "dist",
   "installCommand": "pnpm install",
   "framework": null
 }

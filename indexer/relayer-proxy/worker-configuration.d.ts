@@ -9,6 +9,8 @@ declare namespace Cloudflare {
 		API_KEYS: KVNamespace;
 		NETWORK: "testnet" | "mainnet";
 		RELAYER_BASE_URL: "https://channels.openzeppelin.com/testnet" | "https://channels.openzeppelin.com";
+		/** Optional: Your funded G-address secret key for self-sponsored transactions */
+		SPONSOR_SECRET_KEY?: string;
 	}
 }
 interface Env extends Cloudflare.Env {}

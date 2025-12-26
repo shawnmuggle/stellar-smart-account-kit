@@ -30,6 +30,9 @@ const CONFIG = {
   relayerUrl: import.meta.env.VITE_RELAYER_URL || "",
   // Factory contract for gas-sponsored deployments (optional)
   factoryContractAddress: import.meta.env.VITE_FACTORY_CONTRACT_ADDRESS || "",
+  // Rozo backend API for sponsored deployments
+  rozoApiUrl: import.meta.env.VITE_ROZO_API_URL || "",
+  rozoAnonKey: import.meta.env.VITE_ROZO_CONTRACT_ANON_KEY || "",
 };
 
 // Network detection helper
@@ -368,30 +371,99 @@ function App() {
     log(`Creating wallet for "${name}"...`);
 
     try {
+      // Create passkey WITHOUT auto-submitting deployment
       const result = await kit.createWallet("Smart Account Demo", name, {
-        autoSubmit: true,
+        autoSubmit: false, // Don't deploy on frontend
       });
 
-      log(`Passkey created: ${result.credentialId.slice(0, 20)}...`, "success");
-      log(`Contract address: ${result.contractId}`, "success");
+      // Log frontend-calculated passkey data
+      console.log("=== FRONTEND PASSKEY DATA ===");
+      console.log("Credential ID (base64url):", result.credentialId);
+      console.log("Public Key (Uint8Array):", result.publicKey);
+      console.log("Public Key (base64url):", btoa(String.fromCharCode(...result.publicKey)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
+      console.log("Frontend Contract Address:", result.contractId);
 
-      if (result.submitResult?.success) {
-        log("Wallet deployed successfully!", "success");
-        log(`Transaction: ${result.submitResult.hash.slice(0, 20)}...`, "success");
-        setContractId(result.contractId);
-        setCredentialIdState(result.credentialId);
-        setIsConnected(true);
-        fetchBalance(result.contractId);
-        fetchUsdcBalance(result.contractId);
-        fetchAllSigners(kit, result.credentialId);
-        // Session is automatically saved by the kit
-      } else if (result.submitResult) {
-        log(`Deployment failed: ${result.submitResult.error}`, "error");
-        // Refresh pending credentials to show the failed one
+      log(`Passkey created: ${result.credentialId.slice(0, 20)}...`, "success");
+      log(`Frontend calculated contract: ${result.contractId}`, "info");
+
+      // Convert public key to base64url for backend (65-byte raw key)
+      const publicKeyBase64Url = btoa(String.fromCharCode(...result.publicKey))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      // Prepare backend request body
+      const backendBody = {
+        credential_id_base64: result.credentialId,
+        credential_public_key_raw: publicKeyBase64Url,
+        passkey_name: `RozoWallet.${name}`,
+        meta: { device: "web", version: "1.0.0" },
+      };
+
+      console.log("=== BACKEND REQUEST BODY ===");
+      console.log(JSON.stringify(backendBody, null, 2));
+      log(`Calling backend /register...`, "info");
+
+      // Check if Rozo API is configured
+      if (!CONFIG.rozoApiUrl || !CONFIG.rozoAnonKey) {
+        log("ERROR: VITE_ROZO_API_URL or VITE_ROZO_CONTRACT_ANON_KEY not configured!", "error");
+        console.error("Missing backend configuration. Add to .env:");
+        console.error("VITE_ROZO_API_URL=https://iufqieirueyalyxfzszh.supabase.co/functions/v1");
+        console.error("VITE_ROZO_CONTRACT_ANON_KEY=<your-anon-key>");
+        return;
+      }
+
+      // Call backend /register endpoint
+      const response = await fetch(`${CONFIG.rozoApiUrl}/register`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": CONFIG.rozoAnonKey,
+          "Authorization": `Bearer ${CONFIG.rozoAnonKey}`,
+        },
+        body: JSON.stringify(backendBody),
+      });
+
+      const backendResult = await response.json();
+
+      console.log("=== BACKEND RESPONSE ===");
+      console.log(JSON.stringify(backendResult, null, 2));
+
+      if (backendResult.success) {
+        const backendContract = backendResult.contract_address;
+
+        log(`Backend contract address: ${backendContract}`, "success");
+
+        // Compare frontend and backend contract addresses
+        console.log("=== CONTRACT ADDRESS COMPARISON ===");
+        console.log("Frontend:", result.contractId);
+        console.log("Backend:", backendContract);
+        console.log("Match:", result.contractId === backendContract ? "YES" : "NO");
+
+        if (result.contractId === backendContract) {
+          log("Contract addresses MATCH!", "success");
+        } else {
+          log(`Contract addresses DO NOT MATCH!`, "error");
+          log(`Frontend: ${result.contractId}`, "error");
+          log(`Backend: ${backendContract}`, "error");
+        }
+
+        // Show user info from backend
+        log(`User ID: ${backendResult.user?.id}`, "info");
+        log(`Refer code: ${backendResult.user?.refer}`, "info");
+
+        // Note: NOT deploying from frontend - backend will sponsor and deploy
+        log("Waiting for backend to deploy contract...", "info");
+
+        // Refresh pending credentials
         setPendingCredentials(await kit.credentials.getPending());
+      } else {
+        log(`Backend registration failed: ${backendResult.error}`, "error");
+        console.error("Backend error:", backendResult);
       }
     } catch (error) {
       log(`Failed to create wallet: ${error}`, "error");
+      console.error("Error:", error);
       // Refresh pending credentials in case a credential was created
       setPendingCredentials(await kit.credentials.getPending());
     } finally {

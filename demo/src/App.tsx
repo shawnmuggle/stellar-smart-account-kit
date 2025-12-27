@@ -258,10 +258,8 @@ function App() {
 
       const balanceResult = await server.simulateTransaction(balanceTx);
 
-      let dTokenBalanceRaw = BigInt(0);
       if ("result" in balanceResult && balanceResult.result?.retval) {
         const balance = scValToNative(balanceResult.result.retval);
-        dTokenBalanceRaw = BigInt(balance);
         // DeFindex vaults typically have 7 decimals
         const dTokenBal = (Number(balance) / 10_000_000).toFixed(7);
         setDTokenBalance(dTokenBal);

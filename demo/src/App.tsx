@@ -25,6 +25,8 @@ const CONFIG = {
   webauthnVerifierAddress: import.meta.env.VITE_WEBAUTHN_VERIFIER_ADDRESS || "CBSHV66WG7UV6FQVUTB67P3DZUEJ2KJ5X6JKQH5MFRAAFNFJUAJVXJYV",
   nativeTokenContract: import.meta.env.VITE_NATIVE_TOKEN_CONTRACT || "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
   usdcTokenContract: import.meta.env.VITE_USDC_TOKEN_CONTRACT || "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+  // DeFindex Vault (dToken contract) - for DeFi vault share tokens
+  defindexVaultContract: import.meta.env.VITE_DEFINDEX_VAULT_CONTRACT || "CBNKCU3HGFKHFOF7JTGXQCNKE3G3DXS5RDBQUKQMIIECYKXPIOUGB2S3",
   ed25519VerifierAddress: import.meta.env.VITE_ED25519_VERIFIER_ADDRESS || "CDGMOL3BP6Y6LYOXXTRNXBNJ2SLNTQ47BGG3LOS2OBBE657E3NYCN54B",
   // Relayer fee sponsoring (optional)
   relayerUrl: import.meta.env.VITE_RELAYER_URL || "",
@@ -77,6 +79,10 @@ function App() {
   const [configValid, setConfigValid] = useState(false);
   const [balance, setBalance] = useState<string | null>(null);
   const [usdcBalance, setUsdcBalance] = useState<string | null>(null);
+  const [dTokenBalance, setDTokenBalance] = useState<string | null>(null);
+  const [dTokenSymbol, setDTokenSymbol] = useState<string>("dToken");
+  const [underlyingUsdc, setUnderlyingUsdc] = useState<string | null>(null);
+  const [vaultApy, setVaultApy] = useState<string | null>(null);
   const [autoConnectAttempted, setAutoConnectAttempted] = useState(false);
 
   // Form state
@@ -85,6 +91,8 @@ function App() {
   const [transferAmount, setTransferAmount] = useState("10");
   const [usdcTransferTo, setUsdcTransferTo] = useState("");
   const [usdcTransferAmount, setUsdcTransferAmount] = useState("10");
+  const [dTokenTransferTo, setDTokenTransferTo] = useState("");
+  const [dTokenTransferAmount, setDTokenTransferAmount] = useState("0.01");
 
   // Editable config
   const [accountWasmHash, setAccountWasmHash] = useState(CONFIG.accountWasmHash);
@@ -231,6 +239,101 @@ function App() {
     }
   }, []);
 
+  // Fetch DeFindex dToken balance, underlying USDC, and APY
+  const fetchDTokenBalance = useCallback(async (walletContractId: string) => {
+    try {
+      const server = new rpc.Server(CONFIG.rpcUrl);
+      const contract = new Contract(CONFIG.defindexVaultContract);
+      const dummyAccount = new Account(Keypair.random().publicKey(), "0");
+
+      // Get balance from chain
+      const balanceCall = contract.call("balance", new Address(walletContractId).toScVal());
+      const balanceTx = new TransactionBuilder(dummyAccount, {
+        fee: "100",
+        networkPassphrase: CONFIG.networkPassphrase,
+      })
+        .addOperation(balanceCall)
+        .setTimeout(30)
+        .build();
+
+      const balanceResult = await server.simulateTransaction(balanceTx);
+
+      let dTokenBalanceRaw = BigInt(0);
+      if ("result" in balanceResult && balanceResult.result?.retval) {
+        const balance = scValToNative(balanceResult.result.retval);
+        dTokenBalanceRaw = BigInt(balance);
+        // DeFindex vaults typically have 7 decimals
+        const dTokenBal = (Number(balance) / 10_000_000).toFixed(7);
+        setDTokenBalance(dTokenBal);
+      } else {
+        setDTokenBalance("0.00");
+      }
+
+      // Get symbol from chain
+      const symbolCall = contract.call("symbol");
+      const symbolTx = new TransactionBuilder(dummyAccount, {
+        fee: "100",
+        networkPassphrase: CONFIG.networkPassphrase,
+      })
+        .addOperation(symbolCall)
+        .setTimeout(30)
+        .build();
+
+      const symbolResult = await server.simulateTransaction(symbolTx);
+
+      if ("result" in symbolResult && symbolResult.result?.retval) {
+        const symbol = scValToNative(symbolResult.result.retval);
+        setDTokenSymbol(symbol || "dToken");
+      }
+
+      // Fetch underlying USDC from DeFindex API proxy
+      try {
+        const balanceResponse = await fetch(
+          `https://api-defindex.eng3798.workers.dev/vault/${CONFIG.defindexVaultContract}/balance?from=${walletContractId}&network=mainnet`
+        );
+        if (balanceResponse.ok) {
+          const data = await balanceResponse.json();
+          console.log("DeFindex balance data:", data);
+          // data.underlyingBalance is array of amounts, USDC has 6 decimals
+          if (data.underlyingBalance && data.underlyingBalance.length > 0) {
+            const usdcValue = Number(data.underlyingBalance[0]) / 1_000_000;
+            setUnderlyingUsdc(usdcValue.toFixed(6));
+          } else {
+            setUnderlyingUsdc("0.000000");
+          }
+        } else {
+          console.warn("DeFindex balance API returned:", balanceResponse.status);
+          setUnderlyingUsdc(null);
+        }
+      } catch (e) {
+        console.warn("Failed to fetch underlying USDC:", e);
+        setUnderlyingUsdc(null);
+      }
+
+      // Fetch APY from DeFindex API proxy
+      try {
+        const apyResponse = await fetch(
+          `https://api-defindex.eng3798.workers.dev/vault/${CONFIG.defindexVaultContract}/apy?network=mainnet`
+        );
+        if (apyResponse.ok) {
+          const apyData = await apyResponse.json();
+          console.log("APY data:", apyData);
+          if (apyData && apyData.apy !== undefined) {
+            setVaultApy(apyData.apy.toString());
+          }
+        } else {
+          console.warn("APY API returned:", apyResponse.status);
+        }
+      } catch (e) {
+        console.warn("Failed to fetch APY:", e);
+      }
+    } catch (error) {
+      console.warn("Failed to fetch dToken balance:", error);
+      setDTokenBalance("0.00");
+      setUnderlyingUsdc(null);
+    }
+  }, []);
+
   // Fetch all unique signers from on-chain context rules using SDK
   const fetchAllSigners = useCallback(async (kitInstance: SmartAccountKit, activeCredId: string | null) => {
     try {
@@ -354,6 +457,7 @@ function App() {
         setIsConnected(true);
         fetchBalance(result.contractId);
         fetchUsdcBalance(result.contractId);
+        fetchDTokenBalance(result.contractId);
         fetchAllSigners(kit, result.credentialId);
       }
     };
@@ -361,7 +465,7 @@ function App() {
     autoConnect().catch((error) => {
       log(`Auto-connect failed: ${error}`, "error");
     });
-  }, [kit, configValid, isConnected, autoConnectAttempted, log, fetchBalance, fetchUsdcBalance, fetchAllSigners]);
+  }, [kit, configValid, isConnected, autoConnectAttempted, log, fetchBalance, fetchUsdcBalance, fetchDTokenBalance, fetchAllSigners]);
 
   const handleCreateWallet = async () => {
     if (!kit) return;
@@ -508,6 +612,7 @@ function App() {
           setIsConnected(true);
           fetchBalance(result.contractId);
           fetchUsdcBalance(result.contractId);
+          fetchDTokenBalance(result.contractId);
           fetchAllSigners(kit, result.credentialId);
         }
         return;
@@ -526,6 +631,7 @@ function App() {
         setIsConnected(true);
         fetchBalance(result.contractId);
         fetchUsdcBalance(result.contractId);
+        fetchDTokenBalance(result.contractId);
         fetchAllSigners(kit, result.credentialId);
       }
     } catch (error) {
@@ -557,6 +663,7 @@ function App() {
         setIsConnected(true);
         fetchBalance(result.contractId);
         fetchUsdcBalance(result.contractId);
+        fetchDTokenBalance(result.contractId);
         fetchAllSigners(kit, result.credentialId);
       }
     } catch (error) {
@@ -575,6 +682,7 @@ function App() {
     setContractId(null);
     setBalance(null);
     setUsdcBalance(null);
+    setDTokenBalance(null);
     setCredentialIdState(null);
     setIsConnected(false);
     setAllSigners([]);
@@ -676,6 +784,47 @@ function App() {
     }
   };
 
+  const handleDTokenTransfer = async () => {
+    if (!kit || !isConnected || !contractId) return;
+
+    const recipient = dTokenTransferTo.trim();
+    const amount = parseFloat(dTokenTransferAmount.trim());
+
+    // Validate inputs using SDK utilities
+    try {
+      validateAddress(recipient, "recipient address");
+      validateAmount(amount, "transfer amount");
+    } catch (error) {
+      log(error instanceof Error ? error.message : "Validation failed", "error");
+      return;
+    }
+
+    setLoading("Building dToken transfer...");
+    log(`Transferring ${amount} ${dTokenSymbol} to ${recipient.slice(0, 10)}...`);
+    log(`From smart wallet: ${contractId}`, "info");
+
+    try {
+      // Use the kit's transfer helper with DeFindex vault contract
+      const result = await kit.transfer(
+        CONFIG.defindexVaultContract,
+        recipient,
+        amount
+      );
+
+      if (result.success) {
+        log(`Transfer successful! Sent ${amount} ${dTokenSymbol} to ${recipient.slice(0, 10)}...`, "success");
+        log(`Transaction: ${result.hash.slice(0, 20)}...`, "success");
+        fetchDTokenBalance(contractId);
+      } else {
+        throw new Error(result.error || "Transfer failed");
+      }
+    } catch (error) {
+      log(`dToken Transfer failed: ${error}`, "error");
+    } finally {
+      setLoading(null);
+    }
+  };
+
   // Handle signer selection confirmation for multi-signer transactions
   const handleSignerConfirm = async (selectedSigners: SelectedSigner[]) => {
     if (!kit || !pendingTransfer || !contractId) return;
@@ -759,6 +908,7 @@ function App() {
         setIsConnected(true);
         fetchBalance(result.contractId);
         fetchUsdcBalance(result.contractId);
+        fetchDTokenBalance(result.contractId);
         fetchAllSigners(kit, credential.credentialId);
         // Session is automatically saved by the kit
         // Refresh pending list
@@ -1041,6 +1191,31 @@ function App() {
                 activeSigner={activeSigner}
               />
             </div>
+            <div className="wallet-info-row" style={{ marginTop: "12px" }}>
+              <div className="balance-display" style={{ flex: 1 }}>
+                <div className="balance-label">{dTokenSymbol} Balance (DeFindex Vault)</div>
+                <div className="balance-value">
+                  {dTokenBalance !== null ? `${dTokenBalance} ${dTokenSymbol}` : "—"}
+                </div>
+                <div className="underlying-value">
+                  {underlyingUsdc !== null ? `~${underlyingUsdc} USDC underlying` : "Loading underlying..."}
+                </div>
+              </div>
+            </div>
+            <div className="vault-info-row" style={{ marginTop: "8px" }}>
+              <div className="vault-details">
+                <div className="vault-label">Vault Contract</div>
+                <div className="vault-address">
+                  {CONFIG.defindexVaultContract.slice(0, 10)}...{CONFIG.defindexVaultContract.slice(-6)}
+                </div>
+              </div>
+              <div className="vault-details">
+                <div className="vault-label">Current APY</div>
+                <div className="vault-apy">
+                  {vaultApy !== null ? `${vaultApy}%` : "—"}
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -1181,6 +1356,46 @@ function App() {
                 <span className="spinner" />
               ) : (
                 "Send USDC"
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Transfer dTokens (DeFindex Vault Shares) */}
+      {isConnected && (
+        <div className="card">
+          <h3>Token Transfer ({dTokenSymbol})</h3>
+          <p style={{ fontSize: "0.85rem", color: "#71717a", marginBottom: "12px" }}>
+            DeFindex vault share tokens from {CONFIG.defindexVaultContract.slice(0, 8)}...
+          </p>
+          <div className="form-group">
+            <label>Recipient Address</label>
+            <input
+              type="text"
+              value={dTokenTransferTo}
+              onChange={(e) => setDTokenTransferTo(e.target.value)}
+              placeholder="G... or C..."
+            />
+          </div>
+          <div className="form-group">
+            <label>Amount ({dTokenSymbol})</label>
+            <input
+              type="text"
+              value={dTokenTransferAmount}
+              onChange={(e) => setDTokenTransferAmount(e.target.value)}
+              placeholder="0.01"
+            />
+          </div>
+          <div className="button-group">
+            <button
+              onClick={handleDTokenTransfer}
+              disabled={loading !== null || !dTokenTransferTo}
+            >
+              {loading === "Building dToken transfer..." ? (
+                <span className="spinner" />
+              ) : (
+                `Send ${dTokenSymbol}`
               )}
             </button>
           </div>

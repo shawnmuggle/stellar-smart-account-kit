@@ -418,6 +418,47 @@ button.small .spinner {
   font-weight: 600;
 }
 
+.underlying-value {
+  color: #71717a;
+  font-size: 0.8rem;
+  margin-top: 4px;
+}
+
+/* Vault Info Display */
+.vault-info-row {
+  display: flex;
+  gap: 24px;
+  padding: 12px 16px;
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 8px;
+}
+
+.vault-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vault-label {
+  color: #71717a;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.vault-address {
+  color: #a1a1aa;
+  font-family: monospace;
+  font-size: 0.85rem;
+}
+
+.vault-apy {
+  color: #4ade80;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
 /* Panel descriptions */
 .panel-description {
   color: #a1a1aa;

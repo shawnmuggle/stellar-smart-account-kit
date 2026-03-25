@@ -11,6 +11,8 @@ declare namespace Cloudflare {
 		RELAYER_BASE_URL: "https://channels.openzeppelin.com/testnet" | "https://channels.openzeppelin.com";
 		/** Optional: Your funded G-address secret key for self-sponsored transactions */
 		SPONSOR_SECRET_KEY?: string;
+		/** "1" or "true" = self-sponsored mode; "0", "false", or unset = OZ Channels */
+		SPONSOR_MODE?: string;
 	}
 }
 interface Env extends Cloudflare.Env {}

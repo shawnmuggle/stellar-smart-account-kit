@@ -1,18 +1,14 @@
 /**
  * Smart Account Relayer Proxy - Cloudflare Worker
  *
- * This worker provides a proxy for OpenZeppelin Relayer Channels service,
- * with a self-sponsored fallback for mainnet when OZ channels are underfunded.
+ * This worker provides a proxy for transaction sponsoring on Stellar.
  *
  * Features:
- * - Primary: Uses OZ Relayer Channels SDK for gas sponsoring
- * - Fallback: Self-sponsored mode using your own funded G-address
- * - Automatic API key generation per IP address (persisted indefinitely)
- * - Rate limiting via Relayer's built-in fair use policy
+ * - OZ Channels mode: Uses OZ Relayer Channels SDK for gas sponsoring
+ * - Self-sponsored mode: Uses your own funded G-address as fee payer
+ * - Mode controlled by SPONSOR_MODE env var ("1"/"true" = self-sponsored, default = OZ Channels)
+ * - Automatic API key generation per IP address (OZ Channels mode)
  * - Separate deployments for testnet and mainnet
- *
- * On mainnet, if OZ Channels fail with TxInsufficientBalance, we fall back
- * to self-sponsored mode using SPONSOR_SECRET_KEY.
  */
 
 import { Hono } from "hono";
@@ -46,6 +42,14 @@ app.use("*", cors());
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/**
+ * Check if self-sponsored mode is enabled via SPONSOR_MODE env var
+ */
+function isSelfSponsored(env: Env): boolean {
+  const mode = (env.SPONSOR_MODE || "").trim().toLowerCase();
+  return mode === "1" || mode === "true";
+}
 
 /**
  * Get client IP from request
@@ -355,12 +359,11 @@ async function submitSelfSponsoredXdr(
 
 // Health check
 app.get("/", (c) => {
-  const hasSponsor = !!c.env.SPONSOR_SECRET_KEY;
   return c.json({
     status: "ok",
     service: "smart-account-relayer-proxy",
     network: c.env.NETWORK,
-    selfSponsorEnabled: hasSponsor,
+    mode: isSelfSponsored(c.env) ? "self-sponsored" : "oz-channels",
   });
 });
 
@@ -375,14 +378,13 @@ app.get("/", (c) => {
  * Use func+auth for Address credentials (transfers, wallet operations).
  * Use xdr for source_account auth (deployment) - tx must be signed.
  *
- * Network behavior:
- * - Mainnet: Uses self-sponsored mode (SPONSOR_SECRET_KEY required)
- * - Testnet: Uses OZ Channels with Friendbot retry for missing accounts
+ * Mode is controlled by SPONSOR_MODE env var:
+ * - "1" or "true": self-sponsored (requires SPONSOR_SECRET_KEY)
+ * - "0", "false", or unset: OZ Channels
  */
 app.post("/", async (c) => {
   const ip = getClientIP(c.req.raw);
-  const isMainnet = c.env.NETWORK === "mainnet";
-  const hasSponsor = !!c.env.SPONSOR_SECRET_KEY;
+  const selfSponsored = isSelfSponsored(c.env);
 
   try {
     const body = await c.req.json<{
@@ -410,20 +412,20 @@ app.post("/", async (c) => {
     }
 
     // ========================================================================
-    // MAINNET: Use self-sponsored mode by default
+    // Self-sponsored mode (SPONSOR_MODE = "1" or "true")
     // ========================================================================
-    if (isMainnet) {
-      if (!hasSponsor) {
+    if (selfSponsored) {
+      if (!c.env.SPONSOR_SECRET_KEY) {
         return c.json(
           {
             success: false,
-            error: "Mainnet requires SPONSOR_SECRET_KEY to be configured.",
+            error: "Self-sponsored mode enabled but SPONSOR_SECRET_KEY is not configured.",
           },
           500
         );
       }
 
-      console.log("Mainnet: Using self-sponsored mode...");
+      console.log(`Self-sponsored mode (${c.env.NETWORK})...`);
 
       try {
         if (hasXdr) {
@@ -461,7 +463,7 @@ app.post("/", async (c) => {
     }
 
     // ========================================================================
-    // TESTNET: Use OZ Channels with Friendbot retry
+    // OZ Channels mode (default)
     // ========================================================================
     const apiKeyResult = await getOrCreateApiKey(c.env, ip);
 
@@ -477,71 +479,35 @@ app.post("/", async (c) => {
 
     const client = createClient(c.env, apiKeyResult.apiKey);
 
-    // On testnet, retry for up to 5 minutes to handle channel accounts needing funding
-    const TESTNET_RETRY_DURATION_MS = 5 * 60 * 1000; // 5 minutes
-    const deadline = Date.now() + TESTNET_RETRY_DURATION_MS;
-    const fundedAccounts = new Set<string>(); // Track accounts we've already funded
-
-    // Submit with retry logic for missing accounts
-    while (true) {
-      try {
-        if (hasXdr) {
-          // Fee-bump a signed transaction
-          const result = await client.submitTransaction({ xdr: body.xdr! });
-          return c.json({
-            success: true,
-            data: {
-              transactionId: result.transactionId,
-              hash: result.hash,
-              status: result.status,
-              mode: "oz-channels",
-            },
-          });
-        } else {
-          // Build tx with channel accounts
-          const result = await client.submitSorobanTransaction({
-            func: body.func!,
-            auth: body.auth!,
-          });
-          return c.json({
-            success: true,
-            data: {
-              transactionId: result.transactionId,
-              hash: result.hash,
-              status: result.status,
-              mode: "oz-channels",
-            },
-          });
-        }
-      } catch (submitError) {
-        const errorMessage = submitError instanceof Error ? submitError.message : String(submitError);
-
-        // Check if this is a "missing account" error (testnet reset scenario)
-        const missingAccount = extractMissingAccount(errorMessage);
-        const timeRemaining = deadline - Date.now();
-
-        if (missingAccount && timeRemaining > 0) {
-          // Only fund each account once per request
-          if (!fundedAccounts.has(missingAccount)) {
-            console.log(`Account ${missingAccount} not found. Funding via friendbot (${Math.round(timeRemaining / 1000)}s remaining)...`);
-
-            const funded = await fundWithFriendbot(missingAccount);
-            if (funded) {
-              console.log(`Successfully funded ${missingAccount}. Retrying submission...`);
-              fundedAccounts.add(missingAccount);
-            } else {
-              console.error(`Failed to fund ${missingAccount}`);
-            }
-          } else {
-            console.log(`Account ${missingAccount} already funded, retrying...`);
-          }
-
-          continue; // Retry immediately
-        }
-
-        // Not a recoverable error or deadline exceeded - throw to outer handler
-        throw submitError;
+    try {
+      if (hasXdr) {
+        const result = await client.submitTransaction({ xdr: body.xdr! });
+        return c.json({
+          success: true,
+          data: {
+            transactionId: result.transactionId,
+            hash: result.hash,
+            status: result.status,
+            mode: "oz-channels",
+          },
+        });
+      } else {
+        const result = await client.submitSorobanTransaction({
+          func: body.func!,
+          auth: body.auth!,
+        });
+        return c.json({
+          success: true,
+          data: {
+            transactionId: result.transactionId,
+            hash: result.hash,
+            status: result.status,
+            mode: "oz-channels",
+          },
+        });
       }
+    } catch (submitError) {
+      throw submitError;
     }
   } catch (error) {
     console.error("Relayer submission error:", error);
@@ -624,16 +590,15 @@ app.get("/status", async (c) => {
   const kvKey = getKVKey(ip);
 
   const apiKey = (await c.env.API_KEYS.get(kvKey, "json")) as StoredApiKey | null;
-  const hasSponsor = !!c.env.SPONSOR_SECRET_KEY;
 
   return c.json({
     success: true,
     data: {
       clientIP: ip,
       network: c.env.NETWORK,
+      mode: isSelfSponsored(c.env) ? "self-sponsored" : "oz-channels",
       hasKey: !!apiKey,
       keyCreatedAt: apiKey?.createdAt,
-      selfSponsorEnabled: hasSponsor,
     },
   });
 });

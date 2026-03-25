@@ -19,12 +19,11 @@ id = "6d548e99f4e14aeb93c25c7d2c0928b5"
 # Network this instance serves
 NETWORK = "testnet"
 RELAYER_BASE_URL = "https://channels.openzeppelin.com/testnet"
+# SPONSOR_MODE: "1" or "true" = self-sponsored, "0" or "false" or unset = OZ Channels
+SPONSOR_MODE = "0"
 
-# Self-sponsored mode (optional):
-# If SPONSOR_SECRET_KEY is set, transactions are submitted directly using
-# your own funded G-address instead of OZ Channels.
-# Set this secret using: wrangler secret put SPONSOR_SECRET_KEY
-# SPONSOR_SECRET_KEY = "" # Set via `wrangler secret put SPONSOR_SECRET_KEY`
+# For self-sponsored mode (SPONSOR_MODE = "1"):
+# wrangler secret put SPONSOR_SECRET_KEY
 
 # ============================================================================
 # Production environment (mainnet)
@@ -36,8 +35,9 @@ name = "rozo-wallet-relayer-mainnet"
 [env.production.vars]
 NETWORK = "mainnet"
 RELAYER_BASE_URL = "https://channels.openzeppelin.com"
+SPONSOR_MODE = "1"
 
-# For mainnet self-sponsored mode:
+# For self-sponsored mode:
 # wrangler secret put SPONSOR_SECRET_KEY --env production
 
 [[env.production.kv_namespaces]]

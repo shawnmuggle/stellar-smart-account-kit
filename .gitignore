@@ -31,3 +31,6 @@ pnpm-debug.log*
 # Local development
 *.local
 .claude
+
+Notes.md
+CLAUDE.md

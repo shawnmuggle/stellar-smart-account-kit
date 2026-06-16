@@ -33,6 +33,20 @@ interface StoredApiKey {
   createdAt: number;
 }
 
+// Augment the wrangler-generated global Env with the optional Rozo payin-notify
+// config. These are secrets set via `wrangler secret put`, so they don't appear
+// in wrangler.toml [vars] and aren't picked up by `wrangler types`. `declare
+// global` merges into the global `interface Env` (from worker-configuration.d.ts)
+// instead of shadowing it, so API_KEYS/NETWORK/SPONSOR_SECRET_KEY stay intact.
+declare global {
+  interface Env {
+    /** Rozo backend base URL, e.g. https://intentapiv4.rozo.ai/functions/v1 */
+    PAYIN_NOTIFY_URL?: string;
+    /** Shared secret sent as X-Relayer-Token so the backend can trust this caller */
+    PAYIN_NOTIFY_TOKEN?: string;
+  }
+}
+
 // Hono app with typed environment bindings
 const app = new Hono<{ Bindings: Env }>();
 
@@ -353,6 +367,66 @@ async function submitSelfSponsoredXdr(
   }
 }
 
+/**
+ * Fire-and-forget notify the Rozo backend's /payin endpoint that a Stellar
+ * contract payin just landed on-chain. This is the whole point of the
+ * relayer-notify fast-path: the worker is the earliest place that knows the tx
+ * hash + SUCCESS, ~4.5s before the hash relays back to the frontend.
+ *
+ * Strictly best-effort and additive:
+ * - No-op unless PAYIN_NOTIFY_URL is configured AND paymentId is present.
+ * - Errors are swallowed; the frontend /payin callback + backend cron/mercury
+ *   remain the source of truth, so a dropped notify never loses a payment.
+ * - Only the HTTP status is logged — NEVER the body or the auth token.
+ *
+ * Call via c.executionCtx.waitUntil(...) so the response returns immediately.
+ */
+async function notifyPayinBackend(
+  env: Env,
+  paymentId: string,
+  txHash: string,
+  fromAddress?: string
+): Promise<void> {
+  if (!env.PAYIN_NOTIFY_URL) return; // not configured → no-op
+  // Basic UUID shape guard so a malformed paymentId never reaches the backend.
+  if (!/^[0-9a-fA-F-]{32,40}$/.test(paymentId)) {
+    console.log("[PayinNotify] skipped: paymentId not UUID-shaped");
+    return;
+  }
+
+  const base = env.PAYIN_NOTIFY_URL.replace(/\/+$/, "");
+  const url = `${base}/payment-api/payments/${encodeURIComponent(paymentId)}/payin`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (env.PAYIN_NOTIFY_TOKEN) {
+    // Distinguishes a trusted relayer callback from a public /payin call so the
+    // backend can relax/tighten accordingly. Token is a secret (wrangler secret).
+    headers["X-Relayer-Token"] = env.PAYIN_NOTIFY_TOKEN;
+  }
+  const body = JSON.stringify({
+    txHash,
+    ...(fromAddress ? { fromAddress } : {}),
+  });
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    // Log status only — never the body (may contain order detail) or token.
+    console.log(`[PayinNotify] paymentId=${paymentId} HTTP ${res.status}`);
+  } catch (err) {
+    console.error(
+      `[PayinNotify] paymentId=${paymentId} failed:`,
+      err instanceof Error ? err.message : "unknown error"
+    );
+  }
+}
+
 // ============================================================================
 // API Endpoints
 // ============================================================================
@@ -391,6 +465,11 @@ app.post("/", async (c) => {
       func?: string;
       auth?: string[];
       xdr?: string;
+      // Optional Rozo payment context. When present (and self-sponsored), the
+      // worker fire-and-forgets a /payin notify to the Rozo backend the moment
+      // the tx lands on-chain (SUCCESS). Purely additive: absent → old behavior.
+      paymentId?: string;
+      fromAddress?: string;
     }>();
 
     // Validate: must have either xdr OR (func AND auth)
@@ -430,6 +509,14 @@ app.post("/", async (c) => {
       try {
         if (hasXdr) {
           const result = await submitSelfSponsoredXdr(c.env, body.xdr!);
+          // Earliest point that knows hash + SUCCESS → optionally notify Rozo
+          // backend. Only fires when paymentId is present (additive); response
+          // returns immediately via waitUntil.
+          if (result.status === "SUCCESS" && body.paymentId) {
+            c.executionCtx.waitUntil(
+              notifyPayinBackend(c.env, body.paymentId, result.hash, body.fromAddress)
+            );
+          }
           return c.json({
             success: true,
             data: {
@@ -440,6 +527,11 @@ app.post("/", async (c) => {
           });
         } else {
           const result = await submitSelfSponsored(c.env, body.func!, body.auth!);
+          if (result.status === "SUCCESS" && body.paymentId) {
+            c.executionCtx.waitUntil(
+              notifyPayinBackend(c.env, body.paymentId, result.hash, body.fromAddress)
+            );
+          }
           return c.json({
             success: true,
             data: {

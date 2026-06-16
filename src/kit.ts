@@ -1027,6 +1027,10 @@ export class SmartAccountKit {
       expiration?: number;
       /** Force a specific submission method (relayer or rpc) */
       forceMethod?: SubmissionMethod;
+      /** Optional Rozo payment id forwarded to the relayer proxy (additive) */
+      paymentId?: string;
+      /** Optional sender address hint forwarded alongside paymentId (additive) */
+      fromAddress?: string;
     }
   ): Promise<TransactionResult> {
     return signAndSubmit(
@@ -1103,6 +1107,10 @@ export class SmartAccountKit {
     options?: {
       /** Force a specific submission method (relayer or rpc) */
       forceMethod?: SubmissionMethod;
+      /** Optional Rozo payment id forwarded to the relayer proxy (additive) */
+      paymentId?: string;
+      /** Optional sender address hint forwarded alongside paymentId (additive) */
+      fromAddress?: string;
     }
   ): Promise<TransactionResult & { amount?: number }> {
     return fundWallet(
@@ -1145,6 +1153,10 @@ export class SmartAccountKit {
       credentialId?: string;
       /** Force a specific submission method (relayer or rpc) */
       forceMethod?: SubmissionMethod;
+      /** Optional Rozo payment id forwarded to the relayer proxy (additive) */
+      paymentId?: string;
+      /** Optional sender address hint forwarded alongside paymentId (additive) */
+      fromAddress?: string;
     }
   ): Promise<TransactionResult> {
     return transfer(

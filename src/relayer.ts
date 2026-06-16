@@ -53,6 +53,22 @@ export interface RelayerSendOptions {
    * Default: 30000 (30 seconds)
    */
   timeout?: number;
+
+  /**
+   * Optional Rozo payment id. When present, a self-sponsoring relayer proxy MAY
+   * notify the Rozo backend's /payin endpoint the moment the transaction lands
+   * on-chain, shaving the round-trip of relaying the hash back to the frontend.
+   * Purely additive: a proxy that doesn't understand it ignores it, and the
+   * frontend /payin callback remains the source of truth.
+   */
+  paymentId?: string;
+
+  /**
+   * Optional sender address hint forwarded alongside paymentId. The backend
+   * treats it as a hint only and re-derives the real sender from on-chain data,
+   * so it never drives authorization/settlement decisions.
+   */
+  fromAddress?: string;
 }
 
 /**
@@ -151,8 +167,15 @@ export class RelayerClient {
       "X-Client-Version": CLIENT_VERSION,
     };
 
-    // Build request body - always use func + auth, never xdr
-    const body = JSON.stringify({ func, auth });
+    // Build request body - always use func + auth, never xdr.
+    // paymentId/fromAddress are forwarded only when provided so a proxy can
+    // optionally notify the Rozo backend on-chain-success; omitted otherwise.
+    const body = JSON.stringify({
+      func,
+      auth,
+      ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+      ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+    });
 
     try {
       // Create abort controller for timeout
@@ -245,8 +268,14 @@ export class RelayerClient {
       "X-Client-Version": CLIENT_VERSION,
     };
 
-    // Build request body
-    const body = JSON.stringify({ xdr });
+    // Build request body. paymentId/fromAddress are forwarded only when provided
+    // so a self-sponsoring proxy can optionally notify the Rozo backend on
+    // on-chain-success; omitted otherwise (purely additive).
+    const body = JSON.stringify({
+      xdr,
+      ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+      ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+    });
 
     try {
       // Create abort controller for timeout

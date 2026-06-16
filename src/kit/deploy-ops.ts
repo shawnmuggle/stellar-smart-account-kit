@@ -35,7 +35,12 @@ export async function submitDeploymentTx<T>(
     const method = getSubmissionMethod(deps.relayer, options);
 
     if (method === "relayer" && tx.signed && deps.relayer) {
-      const relayerResult = await deps.relayer.sendXdr(tx.signed);
+      // Forward optional Rozo payment context so the relayer proxy can notify
+      // the backend on on-chain-success. Only set when present (additive).
+      const relayerResult = await deps.relayer.sendXdr(tx.signed, {
+        ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+        ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+      });
 
       if (!relayerResult.success) {
         throw new Error(relayerResult.error ?? "Relayer submission failed");
@@ -275,7 +280,12 @@ export async function submitFactoryDeploymentTx(
       // For Relayer: send func + empty auth (no signatures needed for permissionless factory)
       const funcXdr = hostFunc.toXDR("base64");
 
-      const relayerResult = await deps.relayer.send(funcXdr, []);
+      // Forward optional Rozo payment context so the relayer proxy can notify
+      // the backend on on-chain-success. Only set when present (additive).
+      const relayerResult = await deps.relayer.send(funcXdr, [], {
+        ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+        ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+      });
 
       if (!relayerResult.success) {
         throw new Error(relayerResult.error ?? "Relayer submission failed");

@@ -376,6 +376,21 @@ export interface SubmissionOptions {
    * When not specified, uses Relayer if configured, otherwise RPC.
    */
   forceMethod?: SubmissionMethod;
+
+  /**
+   * Optional Rozo payment id. Only meaningful on the relayer submission path:
+   * it is forwarded to the relayer proxy, which MAY use it to notify the Rozo
+   * backend the instant the transaction lands on-chain. Purely additive and
+   * safe to omit — consumers that don't integrate with Rozo can ignore it.
+   */
+  paymentId?: string;
+
+  /**
+   * Optional sender address hint forwarded alongside `paymentId` on the relayer
+   * path. Treated as a hint only by the backend (it re-derives the real sender
+   * from on-chain data), so it never drives authorization or settlement.
+   */
+  fromAddress?: string;
 }
 
 // ============================================================================

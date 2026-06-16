@@ -85,7 +85,12 @@ export async function sendAndPoll(
       const funcXdr = invokeOp.func.toXDR("base64");
       const authXdrs = (invokeOp.auth ?? []).map((entry) => entry.toXDR("base64"));
 
-      const relayerResult = await deps.relayer.send(funcXdr, authXdrs);
+      // Forward optional Rozo payment context so the relayer proxy can notify
+      // the backend on on-chain-success. Only set when present (additive).
+      const relayerResult = await deps.relayer.send(funcXdr, authXdrs, {
+        ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+        ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+      });
 
       if (!relayerResult.success) {
         return {
@@ -318,6 +323,8 @@ export async function signAndSubmit(
     credentialId?: string;
     expiration?: number;
     forceMethod?: SubmissionMethod;
+    paymentId?: string;
+    fromAddress?: string;
   }
 ): Promise<TransactionResult> {
   if (!deps.getContractId()) {
@@ -353,7 +360,13 @@ export async function signAndSubmit(
       { credentialId: options?.credentialId, expiration: options?.expiration }
     );
 
-    const submissionOpts: SubmissionOptions = { forceMethod: options?.forceMethod };
+    // Carry the optional Rozo payment context through to sendAndPoll/relayer so
+    // it reaches the relayer proxy. Only set when present (additive, safe to omit).
+    const submissionOpts: SubmissionOptions = {
+      forceMethod: options?.forceMethod,
+      ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+      ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+    };
     if (!deps.shouldUseFeeSponsoring(submissionOpts) || deps.hasSourceAccountAuth(preparedTx)) {
       preparedTx.sign(deps.deployerKeypair);
     }
@@ -379,7 +392,7 @@ export async function fundWallet(
     sendAndPoll: (transaction: Transaction, options?: SubmissionOptions) => Promise<TransactionResult>;
   },
   nativeTokenContract: string,
-  options?: { forceMethod?: SubmissionMethod }
+  options?: { forceMethod?: SubmissionMethod; paymentId?: string; fromAddress?: string }
 ): Promise<TransactionResult & { amount?: number }> {
   const contractId = deps.getContractId();
   if (!contractId) {
@@ -593,7 +606,13 @@ export async function fundWallet(
 
     const preparedTx = rpc.assembleTransaction(normalizedTxWithAuth as Transaction, simResult).build();
 
-    const submissionOpts: SubmissionOptions = { forceMethod: options?.forceMethod };
+    // Carry the optional Rozo payment context through to sendAndPoll/relayer so
+    // it reaches the relayer proxy. Only set when present (additive, safe to omit).
+    const submissionOpts: SubmissionOptions = {
+      forceMethod: options?.forceMethod,
+      ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+      ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+    };
     if (!deps.shouldUseFeeSponsoring(submissionOpts) || deps.hasSourceAccountAuth(preparedTx)) {
       preparedTx.sign(tempKeypair);
     }
@@ -635,6 +654,8 @@ export async function transfer(
   options?: {
     credentialId?: string;
     forceMethod?: SubmissionMethod;
+    paymentId?: string;
+    fromAddress?: string;
   }
 ): Promise<TransactionResult> {
   const contractId = deps.getContractId();
@@ -702,7 +723,13 @@ export async function transfer(
       { credentialId: options?.credentialId }
     );
 
-    const submissionOpts: SubmissionOptions = { forceMethod: options?.forceMethod };
+    // Carry the optional Rozo payment context through to sendAndPoll/relayer so
+    // it reaches the relayer proxy. Only set when present (additive, safe to omit).
+    const submissionOpts: SubmissionOptions = {
+      forceMethod: options?.forceMethod,
+      ...(options?.paymentId ? { paymentId: options.paymentId } : {}),
+      ...(options?.fromAddress ? { fromAddress: options.fromAddress } : {}),
+    };
     if (!deps.shouldUseFeeSponsoring(submissionOpts) || deps.hasSourceAccountAuth(preparedTx)) {
       preparedTx.sign(deps.deployerKeypair);
     }

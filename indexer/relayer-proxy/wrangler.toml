@@ -3,6 +3,14 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Workers Logs: keep request/console logs queryable in the CF dashboard
+# (Observability tab) so we can debug a specific payment after the fact instead
+# of having to catch it live with `wrangler tail`.
+[observability]
+enabled = true
+[observability.logs]
+invocation_logs = true
+
 # KV Namespace for storing API keys per IP
 # Create KV namespace:
 # wrangler kv namespace create API_KEYS

@@ -43,7 +43,7 @@ declare global {
     /** Rozo backend base URL, e.g. https://intentapiv4.rozo.ai/functions/v1 */
     PAYIN_NOTIFY_URL?: string;
     /** Shared secret sent as X-Relayer-Token so the backend can trust this caller */
-    PAYIN_NOTIFY_TOKEN?: string;
+    WALLETAPP_PAYIN_NOTIFY_TOKEN?: string;
   }
 }
 
@@ -282,29 +282,36 @@ async function submitSelfSponsored(
   // Submit the transaction
   const sendResult = await server.sendTransaction(preparedTx);
 
+  // sendTransaction status ∈ PENDING | DUPLICATE | TRY_AGAIN_LATER | ERROR.
+  // Only ERROR (RPC outright rejected the submit) throws — same as before.
+  // We DELIBERATELY do NOT throw on TRY_AGAIN_LATER: the current frontend hasn't
+  // been upgraded to handle a new error shape, and throwing would surface a
+  // brand-new failure to existing App users. Instead we log it (visible in
+  // Workers Logs) so we can SEE how often the RPC soft-rejects a submit on weak
+  // networks, while preserving the existing return-hash-PENDING behavior. The
+  // backend backstops (finalizeSubmission poll + reconciler + cron) handle the
+  // case where such a tx never actually lands.
   if (sendResult.status === "ERROR") {
     throw new Error(`Transaction submission failed: ${sendResult.errorResult?.toXDR("base64") || "unknown error"}`);
   }
-
-  // Poll for result
-  const hash = sendResult.hash;
-  let getResult = await server.getTransaction(hash);
-  const maxWaitMs = 30000;
-  const startTime = Date.now();
-
-  while (getResult.status === "NOT_FOUND" && Date.now() - startTime < maxWaitMs) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    getResult = await server.getTransaction(hash);
-  }
-
-  if (getResult.status === "SUCCESS") {
-    return { hash, status: "SUCCESS" };
-  } else if (getResult.status === "FAILED") {
-    throw new Error(`Transaction failed on-chain: ${hash}`);
+  if (sendResult.status === "TRY_AGAIN_LATER") {
+    console.warn(`[Submit] sendTransaction TRY_AGAIN_LATER (not broadcast) tx=${maskHash(sendResult.hash || "")} — returning PENDING anyway for FE compat`);
   } else {
-    // Still NOT_FOUND after waiting
-    return { hash, status: "PENDING" };
+    console.log(`[Submit] sendTransaction ${sendResult.status} tx=${maskHash(sendResult.hash || "")}`);
   }
+
+  // A+D weak-network fix: submission succeeded → return the hash IMMEDIATELY
+  // with status PENDING. We DO NOT block the request polling getTransaction for
+  // up to 30s anymore — that required the (possibly weak-network) client
+  // connection to survive ~35s, and a drop in that window left the tx maybe
+  // on-chain with the hash never reaching the client (order stuck unpaid,
+  // invisible). "Wait for on-chain finality" now runs in the worker's
+  // executionCtx.waitUntil (finalizeSubmission) + the backend's /payin recheck,
+  // getEvents cron, Mercury webhook, and the relayer_submissions reconciler.
+  // sendResult.status === "ERROR" still throws above (RPC rejected the submit =
+  // real failure the client must hear about). See
+  // internaldocs/20260616-relayer-submit-decouple-weaknet.md (backend repo).
+  return { hash: sendResult.hash, status: "PENDING" };
 }
 
 /**
@@ -343,28 +350,23 @@ async function submitSelfSponsoredXdr(
   // Submit the fee-bump transaction
   const sendResult = await server.sendTransaction(feeBumpTx);
 
+  // Only ERROR throws (same as before). TRY_AGAIN_LATER is logged, not thrown —
+  // see submitSelfSponsored above: don't surface a new error to the un-upgraded
+  // frontend; keep returning hash+PENDING and let the backend backstops catch
+  // a tx that never lands.
   if (sendResult.status === "ERROR") {
     throw new Error(`Transaction submission failed: ${sendResult.errorResult?.toXDR("base64") || "unknown error"}`);
   }
-
-  // Poll for result
-  const hash = sendResult.hash;
-  let getResult = await server.getTransaction(hash);
-  const maxWaitMs = 30000;
-  const startTime = Date.now();
-
-  while (getResult.status === "NOT_FOUND" && Date.now() - startTime < maxWaitMs) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    getResult = await server.getTransaction(hash);
-  }
-
-  if (getResult.status === "SUCCESS") {
-    return { hash, status: "SUCCESS" };
-  } else if (getResult.status === "FAILED") {
-    throw new Error(`Transaction failed on-chain: ${hash}`);
+  if (sendResult.status === "TRY_AGAIN_LATER") {
+    console.warn(`[SubmitXdr] sendTransaction TRY_AGAIN_LATER (not broadcast) tx=${maskHash(sendResult.hash || "")} — returning PENDING anyway for FE compat`);
   } else {
-    return { hash, status: "PENDING" };
+    console.log(`[SubmitXdr] sendTransaction ${sendResult.status} tx=${maskHash(sendResult.hash || "")}`);
   }
+
+  // A+D weak-network fix (see submitSelfSponsored above for the full rationale):
+  // return the hash immediately with PENDING; finality is resolved off the
+  // request path by finalizeSubmission (waitUntil) + backend backstops.
+  return { hash: sendResult.hash, status: "PENDING" };
 }
 
 /**
@@ -397,10 +399,10 @@ async function notifyPayinBackend(
   const base = env.PAYIN_NOTIFY_URL.replace(/\/+$/, "");
   const url = `${base}/payment-api/payments/${encodeURIComponent(paymentId)}/payin`;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (env.PAYIN_NOTIFY_TOKEN) {
+  if (env.WALLETAPP_PAYIN_NOTIFY_TOKEN) {
     // Distinguishes a trusted relayer callback from a public /payin call so the
     // backend can relax/tighten accordingly. Token is a secret (wrangler secret).
-    headers["X-Relayer-Token"] = env.PAYIN_NOTIFY_TOKEN;
+    headers["X-Relayer-Token"] = env.WALLETAPP_PAYIN_NOTIFY_TOKEN;
   }
   const body = JSON.stringify({
     txHash,
@@ -425,6 +427,131 @@ async function notifyPayinBackend(
       err instanceof Error ? err.message : "unknown error"
     );
   }
+}
+
+/**
+ * Mask a tx hash for logging: first 6 + last 4 only. The hash is public chain
+ * data, but we keep logs terse and consistent with the backend's masking.
+ */
+function maskHash(h: string): string {
+  return h.length > 12 ? `${h.slice(0, 6)}…${h.slice(-4)}` : "<hash>";
+}
+
+/**
+ * Fire-and-forget upsert into the backend's relayer_submissions table (method
+ * D of the A+D weak-network fix). This is the SERVER-SIDE record that makes a
+ * "submitted but the client may not have received the hash" tx visible to ops
+ * even when this isolate dies. Best-effort, additive, never throws.
+ *
+ * Posts to {PAYIN_NOTIFY_URL}/payment-api/relayer-submissions with the shared
+ * X-Relayer-Token. No-op unless PAYIN_NOTIFY_URL is configured. Logs HTTP
+ * status + masked hash + outcome only — NEVER the token, full body, or raw
+ * error text (network/RPC error messages can be noisy; we log a coarse tag).
+ *
+ * Returns true iff the row was durably accepted (HTTP 2xx). The caller uses
+ * this for the stage-1 retry (codex P1): a failed pending_unknown write means
+ * the reconciler has no row to heal, so stage 1 retries once before giving up.
+ * (No-op when unconfigured also returns true — there's nothing to persist.)
+ */
+async function reportSubmission(
+  env: Env,
+  args: { hash: string; paymentId?: string; outcome: "pending_unknown" | "success" | "failed" }
+): Promise<boolean> {
+  if (!env.PAYIN_NOTIFY_URL) return true; // not configured → no-op (nothing to persist)
+  const base = env.PAYIN_NOTIFY_URL.replace(/\/+$/, "");
+  const url = `${base}/payment-api/relayer-submissions`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (env.WALLETAPP_PAYIN_NOTIFY_TOKEN) headers["X-Relayer-Token"] = env.WALLETAPP_PAYIN_NOTIFY_TOKEN;
+  const body = JSON.stringify({
+    txHash: args.hash,
+    outcome: args.outcome,
+    network: env.NETWORK,
+    ...(args.paymentId ? { paymentId: args.paymentId } : {}),
+  });
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(url, { method: "POST", headers, body, signal: controller.signal });
+    clearTimeout(timeoutId);
+    console.log(`[RelayerSubmission] ${args.outcome} tx=${maskHash(args.hash)} HTTP ${res.status}`);
+    return res.ok;
+  } catch {
+    // Coarse tag only — never the raw error text (P3: keep the logging contract
+    // tight). A network/timeout failure here is benign; the reconciler is the
+    // backstop for any row we couldn't persist.
+    console.error(`[RelayerSubmission] ${args.outcome} tx=${maskHash(args.hash)} network_error`);
+    return false;
+  }
+}
+
+/**
+ * Background finalizer for a submitted tx (A+D weak-network fix, methods A+D).
+ * Runs via c.executionCtx.waitUntil so the HTTP response already returned
+ * PENDING — Cloudflare keeps this alive ~30s after the client disconnects,
+ * enough for one Stellar ledger close (~5s).
+ *
+ * TWO-STAGE WRITE (codex P1#1): the FIRST thing it does is record the row as
+ * pending_unknown (with one quick retry on a transient failure, so a flaky
+ * network blip doesn't silently leave the reconciler nothing to heal). If this
+ * isolate is then recycled or the poll times out, the row still exists for the
+ * reconciler cron (Task 3) to finalize by tx_hash. The poll here is only the
+ * fast path.
+ *
+ * Even if BOTH stage-1 writes fail, correctness is preserved: relayer_submissions
+ * is OBSERVABILITY, not the settlement path. The tx (if it landed) is still
+ * settled by /payin recheck + getEvents cron + Mercury webhook keyed on the
+ * on-chain memo. The only loss in that worst case is one row's ops-visibility.
+ *
+ * ⚠️ NOTE: A+D does NOT prevent on-chain double-debit on client retry. The
+ * first send can land on-chain, the client can disconnect, and a retry can send
+ * (and debit) a SECOND tx. memo+CAS in settleContractPayin only prevents
+ * double-SETTLEMENT to the merchant, not a second on-chain debit. This is a
+ * known residual risk; the root fix is pre-sign idempotency (plan B), not done
+ * here. Do not "fix" this by suppressing the early return — that reintroduces
+ * the weak-network failure this whole change exists to remove.
+ */
+async function finalizeSubmission(
+  env: Env,
+  hash: string,
+  paymentId?: string,
+  fromAddress?: string
+): Promise<void> {
+  // Stage 1: record pending_unknown immediately (even with no paymentId — codex
+  // P2#8). This is the row the reconciler heals if the poll below never lands,
+  // so retry once on a transient failure before moving on (codex P1).
+  const stage1ok = await reportSubmission(env, { hash, paymentId, outcome: "pending_unknown" });
+  if (!stage1ok) {
+    await reportSubmission(env, { hash, paymentId, outcome: "pending_unknown" });
+  }
+
+  // Fast path: poll for finality within the waitUntil budget (~25s of ~30s).
+  const rpcUrl = getRpcUrl(env.NETWORK);
+  const server = new rpc.Server(rpcUrl);
+  let finalStatus: "SUCCESS" | "FAILED" | "PENDING" = "PENDING";
+  try {
+    let r = await server.getTransaction(hash);
+    const start = Date.now();
+    while (r.status === "NOT_FOUND" && Date.now() - start < 25000) {
+      await new Promise((res) => setTimeout(res, 1000));
+      r = await server.getTransaction(hash);
+    }
+    if (r.status === "SUCCESS") finalStatus = "SUCCESS";
+    else if (r.status === "FAILED") finalStatus = "FAILED";
+    // else still NOT_FOUND → leave PENDING; reconciler cron picks it up.
+  } catch {
+    // RPC error during polling → stay PENDING; reconciler is the backstop.
+    // Coarse tag only (P3) — the raw RPC error text is noisy and adds nothing.
+    console.error(`[FinalizeSubmission] tx=${maskHash(hash)} poll_error`);
+  }
+
+  if (finalStatus === "SUCCESS") {
+    await reportSubmission(env, { hash, paymentId, outcome: "success" });
+    // SUCCESS + paymentId → notify the backend /payin (the original fast-path).
+    if (paymentId) await notifyPayinBackend(env, paymentId, hash, fromAddress);
+  } else if (finalStatus === "FAILED") {
+    await reportSubmission(env, { hash, paymentId, outcome: "failed" });
+  }
+  // PENDING → already recorded pending_unknown in stage 1; reconciler finalizes.
 }
 
 // ============================================================================
@@ -509,14 +636,15 @@ app.post("/", async (c) => {
       try {
         if (hasXdr) {
           const result = await submitSelfSponsoredXdr(c.env, body.xdr!);
-          // Earliest point that knows hash + SUCCESS → optionally notify Rozo
-          // backend. Only fires when paymentId is present (additive); response
-          // returns immediately via waitUntil.
-          if (result.status === "SUCCESS" && body.paymentId) {
-            c.executionCtx.waitUntil(
-              notifyPayinBackend(c.env, body.paymentId, result.hash, body.fromAddress)
-            );
-          }
+          // Submission succeeded → result.status is PENDING (we no longer block
+          // for finality). Resolve finality + record relayer_submissions + notify
+          // /payin entirely off the request path in finalizeSubmission. ALWAYS
+          // runs (records by tx_hash even with no paymentId — codex P2#8). The
+          // response returns immediately so weak-network clients don't need the
+          // connection to survive the on-chain wait.
+          c.executionCtx.waitUntil(
+            finalizeSubmission(c.env, result.hash, body.paymentId, body.fromAddress)
+          );
           return c.json({
             success: true,
             data: {
@@ -527,11 +655,9 @@ app.post("/", async (c) => {
           });
         } else {
           const result = await submitSelfSponsored(c.env, body.func!, body.auth!);
-          if (result.status === "SUCCESS" && body.paymentId) {
-            c.executionCtx.waitUntil(
-              notifyPayinBackend(c.env, body.paymentId, result.hash, body.fromAddress)
-            );
-          }
+          c.executionCtx.waitUntil(
+            finalizeSubmission(c.env, result.hash, body.paymentId, body.fromAddress)
+          );
           return c.json({
             success: true,
             data: {
